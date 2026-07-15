@@ -2,8 +2,6 @@
 
 可安装到 [new-api](https://github.com/QuantumNous/new-api) 的 **Vision Interception** 插件：在请求到达目标模型前，把图片转成文字描述，让纯文本模型也能「看图」。
 
-> 本仓库**只包含插件与接入说明**，不包含 new-api 本体源码。
-
 ## 功能
 
 - 用户级配置（个人资料页）：启用、视觉模型、后缀、prompt、pHash 阈值
