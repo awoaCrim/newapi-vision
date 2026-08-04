@@ -11,7 +11,7 @@
 - [简介](#简介)
 - [特性](#特性)
 - [工作原理](#工作原理)
-- [合并到 new-api](#合并到-new-api)
+- [安装（合并到 new-api）](#安装合并到-new-api)
 - [使用](#使用)
 - [目录结构](#目录结构)
 - [限制与注意](#限制与注意)
@@ -57,9 +57,14 @@ vision_intercept.go 中间件
 标准计费：预扣 → 成功结算（PostTextConsumeQuota）/ 失败自动退款（Refund）
 ```
 
-## 合并到 new-api
+## 安装（合并到 new-api）
 
-前置：一份可编译的 new-api 源码（Go 版本满足 go.mod 要求）。
+### 前置条件
+
+- new-api 源码一份（Go `1.25.1`，与 go.mod 一致）
+- Node.js 18+（构建前端，前端产物由 Go `go:embed web/default/dist` 打包，**跳过前端构建会编译失败**）
+
+### 步骤
 
 ```bash
 # 1. 复制新增源码
@@ -69,14 +74,30 @@ cp src/web/profile/components/vision-settings-card.tsx \
    <new-api>/web/default/src/features/profile/components/
 
 # 2. 按 patches/ 修改既有文件
-#    dto/user_settings.go、constant/context_key.go、controller/user.go、
-#    router/relay-router.go、web/types.ts、web/index.tsx、go.mod
+#    完整新文件直接复制；.snippet / .diff 为修改片段，按注释手工应用
+#    - dto/user_settings.go        添加 VisionUserSetting（patches/dto_user_settings.go）
+#    - constant/context_key.go     添加 ContextKeyVisionIntercepted（patches/constant_context_key.go）
+#    - controller/user.go          校验设置（patches/controller_user.go.snippet）
+#    - router/relay-router.go      挂载拦截中间件（patches/router_relay_router.go.snippet）
+#    - web/types.ts、web/index.tsx 前端类型与卡片挂载（patches/web_profile_types.ts、web_profile_index.tsx）
+#    - go.mod                      依赖变更（patches/go.mod.diff）
 
-# 3. 构建
+# 3. 构建前端（产物嵌入 Go 二进制，必须执行）
+cd <new-api>/web/default
+npm install && npm run build
+
+# 4. 构建后端
+cd <new-api>
 go mod tidy && go build -o new-api .
 ```
 
-patches/ 约定：完整新文件可直接复制；`.snippet` / `.diff` 是既有文件的修改片段，需按注释手工应用。
+### 部署与验证
+
+替换二进制后重启服务（Docker 环境重新构建镜像即可）。验证：
+
+- 个人资料页出现 **Vision Interception** 设置卡片，启用并选择视觉模型
+- 日志出现 `[vision] found N images (...)`、`[vision] replaced N/M images` 即为拦截生效
+- 请求模型名加 `-vision` 后缀，返回正常即安装成功
 
 ## 使用
 
