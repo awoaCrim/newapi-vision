@@ -1,21 +1,19 @@
 # new-api Vision Interception
 
-让纯文本模型也能处理图片，并避免向目标模型重复转发图片 base64。
+在请求进入目标模型前，将图片转换为文字描述，让纯文本模型也能处理图片。
 
 [![Base](https://img.shields.io/badge/base-new--api-green)](https://github.com/QuantumNous/new-api)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-orange)](https://github.com/QuantumNous/new-api/blob/main/LICENSE)
 
 ## 简介
 
-这是一个面向 [new-api](https://github.com/QuantumNous/new-api) 的视觉拦截扩展。
-
 当请求模型名带有 `-vision` 后缀时，中间件会：
 
-1. 提取请求中的图片；
-2. 调用配置的视觉模型生成图片描述；
-3. 将图片替换为文字；
+1. 提取消息中的图片；
+2. 调用用户配置的视觉模型生成描述；
+3. 将图片块替换为文本；
 4. 移除模型名中的 `-vision`；
-5. 将纯文本请求转发给目标模型。
+5. 将请求转发给目标文本模型。
 
 例如：
 
@@ -25,18 +23,18 @@ deepseek-v4-flash-vision
 deepseek-v4-flash
 ```
 
-目标模型不需要支持图片输入。
+目标模型本身不需要支持图片输入。
 
 ## 特性
 
 * 支持 OpenAI 和 Claude 消息格式
 * 支持 base64 和 URL 图片
-* 用户级视觉模型、Prompt、后缀配置
+* 用户级视觉模型、Prompt、后缀和 pHash 配置
 * 请求内图片去重
 * pHash 相似图片缓存
 * singleflight 并发请求合并
-* 缓存按用户、模型和 Prompt 隔离
-* 图片分析使用 new-api 标准计费流程
+* 缓存按用户、视觉模型和 Prompt 隔离
+* 视觉调用使用 new-api 标准计费流程
 * 图片分析失败时直接返回错误
 * 转发给目标模型时不再携带已处理图片
 
@@ -47,75 +45,35 @@ deepseek-v4-flash
 model: deepseek-v4-flash-vision
         │
         ▼
-VisionIntercept 中间件
+提取图片并查询缓存
         │
-        ├─ 提取图片
-        ├─ 计算 pHash
-        ├─ 查询缓存
-        └─ 调用视觉模型生成描述
+        ├─ 命中：复用描述
+        └─ 未命中：调用视觉模型
         │
         ▼
 图片块替换为文本描述
-模型名改为 deepseek-v4-flash
+model: deepseek-v4-flash
         │
         ▼
 目标文本模型
 ```
 
-## 图片处理规则
-
-最后一条 `user` 消息中的图片视为当前图片：
-
-* 缓存命中时直接复用描述；
-* 未命中时调用视觉模型；
-* 调用成功后写入缓存。
-
-历史消息中的图片：
-
-* 只查询缓存；
-* 缓存未命中时不会重新分析；
-* 会替换为以下占位符：
-
-```text
-[This image was not parsed — its visual content is unavailable]
-```
-
-这样可以避免长对话反复分析历史图片。
-
-## pHash 阈值
-
-pHash 用于判断图片是否相似。
-
-范围：
-
-```text
-0 ～ 64
-```
-
-* `0`：禁用
-* 数值越小：判断越严格
-* 数值越大：判断越宽松
-* 默认值：`10`
-
-阈值过高可能导致不同图片错误复用同一描述。
-
 ## 安装
 
-### 环境要求
+### 前置条件
 
-* new-api 源码
-* 与 new-api `go.mod` 一致的 Go 版本
-* Node.js 18+
-* npm
+* 一份可正常构建的 new-api 源码
+* 与目标 new-api `go.mod` 匹配的 Go 版本
+* 与目标 new-api 前端项目兼容的 Node.js 和包管理器
 
 建议先创建独立分支：
 
 ```bash
-cd /path/to/new-api
+cd <new-api>
 git checkout -b feature/vision-interception
 ```
 
-### 1. 复制后端文件
+### 1. 复制新增文件
 
 ```bash
 cp src/middleware/vision_intercept.go \
@@ -125,30 +83,26 @@ mkdir -p <new-api>/service/vision
 
 cp src/service/vision/vision.go \
   <new-api>/service/vision/vision.go
-```
 
-### 2. 复制前端组件
-
-```bash
 cp src/web/profile/components/vision-settings-card.tsx \
   <new-api>/web/default/src/features/profile/components/
 ```
 
-### 3. 合并补丁
+### 2. 合并补丁
 
-按照 `patches/` 目录中的说明修改对应文件：
+按照 `patches/` 中的说明修改对应文件：
 
-| 文件                               | 作用             |
-| -------------------------------- | -------------- |
-| `dto_user_settings.go`           | 添加视觉配置结构       |
-| `constant_context_key.go`        | 添加 Context Key |
-| `controller_user.go.snippet`     | 保存并校验用户配置      |
-| `router_relay_router.go.snippet` | 挂载视觉中间件        |
-| `web_profile_types.ts`           | 添加前端类型         |
-| `web_profile_index.tsx`          | 挂载设置卡片         |
-| `go.mod.diff`                    | 添加 Go 依赖       |
+| 补丁文件                             | 目标文件                                                   |
+| -------------------------------- | ------------------------------------------------------ |
+| `dto_user_settings.go`           | `<new-api>/dto/user_settings.go`                       |
+| `constant_context_key.go`        | `<new-api>/constant/context_key.go`                    |
+| `controller_user.go.snippet`     | `<new-api>/controller/user.go`                         |
+| `router_relay_router.go.snippet` | `<new-api>/router/relay-router.go`                     |
+| `web_profile_types.ts`           | `<new-api>/web/default/src/features/profile/types.ts`  |
+| `web_profile_index.tsx`          | `<new-api>/web/default/src/features/profile/index.tsx` |
+| `go.mod.diff`                    | `<new-api>/go.mod`                                     |
 
-`go.mod.diff` 只是修改说明，不能直接执行 `git apply`。
+`go.mod.diff` 是依赖修改说明，不是标准 Git diff，不能直接执行 `git apply`。
 
 需要添加：
 
@@ -156,16 +110,16 @@ cp src/web/profile/components/vision-settings-card.tsx \
 github.com/corona10/goimagehash v1.1.0
 ```
 
-然后运行：
+然后执行：
 
 ```bash
 cd <new-api>
 go mod tidy
 ```
 
-### 4. 构建前端
+### 3. 构建前端
 
-new-api 会通过 `go:embed` 打包前端产物，因此必须先构建前端：
+前端产物会被 Go 通过 `go:embed` 打包，因此需要先完成前端构建：
 
 ```bash
 cd <new-api>/web/default
@@ -173,7 +127,7 @@ npm install
 npm run build
 ```
 
-### 5. 构建后端
+### 4. 构建后端
 
 ```bash
 cd <new-api>
@@ -181,7 +135,7 @@ go mod tidy
 go build -o new-api .
 ```
 
-完成后替换原二进制并重启服务。Docker 用户需要重新构建镜像。
+构建完成后替换原二进制并重启服务。Docker 部署需要重新构建镜像。
 
 ## 配置
 
@@ -191,7 +145,7 @@ go build -o new-api .
 个人资料 → Vision Interception
 ```
 
-可以配置：
+可配置以下内容：
 
 | 配置              | 说明                |
 | --------------- | ----------------- |
@@ -199,15 +153,38 @@ go build -o new-api .
 | Vision Model    | 用于生成图片描述的视觉模型     |
 | Prompt Template | 图片描述提示词           |
 | Model Suffix    | 触发后缀，默认 `-vision` |
-| pHash Threshold | 相似图片阈值，默认 `10`    |
+| pHash Threshold | 相似图片判断阈值，默认 `10`  |
 
-视觉模型必须是 new-api 中已经可用的模型。
+视觉模型必须是当前 new-api 中可用的模型。
 
-默认 Prompt 示例：
+默认 Prompt：
 
 ```text
 Please describe this image in detail, including all objects, text, people, colors, layout, and atmosphere.
 ```
+
+## pHash 阈值
+
+pHash 使用汉明距离判断图片是否相似。
+
+有效范围：
+
+```text
+0 ～ 64
+```
+
+* `0`：禁用 pHash，每张图片独立处理
+* 阈值越低：判断越严格
+* 阈值越高：判断越宽松
+* 默认值：`10`
+
+判断逻辑为：
+
+```text
+HammingDistance <= threshold
+```
+
+阈值过高可能导致不同图片错误复用相同描述。
 
 ## 使用示例
 
@@ -237,7 +214,7 @@ curl https://your-new-api.example.com/v1/chat/completions \
   }'
 ```
 
-处理后，目标模型收到的请求类似：
+处理后发送给目标模型的内容类似：
 
 ```json
 {
@@ -260,6 +237,21 @@ curl https://your-new-api.example.com/v1/chat/completions \
 }
 ```
 
+## 历史图片
+
+最后一条 `user` 消息中的图片视为当前图片：
+
+* 缓存命中时复用描述
+* 未命中时调用视觉模型
+
+历史消息中的图片只查询缓存，不会重新调用视觉模型。
+
+历史图片没有缓存时会被替换为：
+
+```text
+[This image was not parsed — its visual content is unavailable]
+```
+
 ## 支持的接口
 
 ```text
@@ -271,13 +263,14 @@ curl https://your-new-api.example.com/v1/chat/completions \
 
 其他接口不会触发视觉拦截。
 
-## 安装验证
+## 验证
 
-安装完成后检查：
+安装完成后：
 
-1. 个人资料页出现 `Vision Interception` 设置卡片；
-2. 请求模型使用 `deepseek-v4-flash-vision`；
-3. 日志中出现类似内容：
+1. 个人资料页应出现 `Vision Interception` 设置卡片；
+2. 启用功能并配置视觉模型；
+3. 使用 `deepseek-v4-flash-vision` 发送带图请求；
+4. 检查日志：
 
 ```text
 [vision] intercepting model=deepseek-v4-flash-vision suffix=-vision
@@ -290,14 +283,15 @@ curl https://your-new-api.example.com/v1/chat/completions \
 | 项目          |      限制 |
 | ----------- | ------: |
 | data URI 长度 |  20 MiB |
-| 图片下载大小      |  15 MiB |
+| URL 图片下载大小  |  15 MiB |
 | 图片单边尺寸      | 8192 像素 |
 | 图片总像素       |  2000 万 |
+| pHash 阈值    |    0～64 |
 | Prompt 长度   | 8000 字符 |
 | 模型后缀长度      |   64 字符 |
-| 单组图片分析超时    |    30 秒 |
+| 单组视觉分析超时    |    30 秒 |
 
-URL 图片只支持 `http` 和 `https`，并会执行 SSRF、大小和图片尺寸校验。
+URL 图片仅支持 `http` 和 `https`，并会进行 SSRF、大小和图片尺寸检查。
 
 `video_url` 不会被处理。
 
@@ -308,16 +302,16 @@ URL 图片只支持 `http` 和 `https`，并会执行 SSRF、大小和图片尺�
 1. 视觉模型生成图片描述；
 2. 目标文本模型生成最终回答。
 
-视觉调用使用 new-api 标准计费流程。缓存命中时不会重复调用视觉模型，但目标模型请求仍会正常计费。
+缓存命中时不会再次调用视觉模型，但目标模型请求仍会正常计费。
 
-## 已知问题
+## 已知限制
 
-* 当前需要手工合并源码；
-* new-api 更新后可能需要重新适配；
-* 缓存保存在当前进程内，重启后会丢失；
-* 多实例之间不共享缓存；
-* 历史图片没有缓存时不会重新分析；
-* 图片转文字可能损失部分视觉信息。
+* 当前需要手工合并源码
+* new-api 更新后可能需要重新适配
+* 缓存保存在进程内，服务重启后会丢失
+* 多实例之间不共享缓存
+* 历史图片没有缓存时不会重新分析
+* 图片转文字可能损失部分视觉信息
 
 ## 目录结构
 
@@ -345,7 +339,7 @@ patches/
 
 ## 许可证
 
-本项目采用 AGPL-3.0，许可证与 new-api 保持一致。
+本项目采用 AGPL-3.0，与 new-api 保持一致。
 
 ## 致谢
 
