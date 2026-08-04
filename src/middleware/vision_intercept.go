@@ -1,8 +1,9 @@
-package vision
+package middleware
 
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/service/vision"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -25,17 +27,13 @@ import (
 // VisionIntercept 视觉拦截中间件
 func VisionIntercept() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 从用户设置 Extensions 读取视觉配置（用户级）
+		// 从用户设置读取视觉配置（用户级）
 		userSetting, exists := common.GetContextKeyType[dto.UserSetting](c, constant.ContextKeyUserSetting)
-		if !exists {
+		if !exists || userSetting.Vision == nil || !userSetting.Vision.Enabled || userSetting.Vision.VisionSuffix == "" {
 			c.Next()
 			return
 		}
-		settings, ok := parseVisionSettings(userSetting)
-		if !ok || !settings.Enabled || settings.VisionSuffix == "" {
-			c.Next()
-			return
-		}
+		settings := userSetting.Vision
 
 		if !strings.HasPrefix(c.Request.Header.Get("Content-Type"), "application/json") {
 			c.Next()
@@ -72,13 +70,13 @@ func VisionIntercept() gin.HandlerFunc {
 		// 无消息 → 仅去后缀
 		messagesRaw := gjson.GetBytes(bodyBytes, "messages")
 		if !messagesRaw.Exists() || !messagesRaw.IsArray() {
-			stripSuffixAndProceed(c, bodyBytes, strippedModel)
+			stripSuffixAndProceed(c, bodyBytes, strippedModel, false, settings)
 			return
 		}
 
 		isClaudeFormat := isClaudeMessageFormat(messagesRaw)
 
-		var images []ImageBlock
+		var images []vision.ImageBlock
 		var extractErr error
 		if isClaudeFormat {
 			images, extractErr = extractClaudeImages(bodyBytes)
@@ -105,7 +103,7 @@ func VisionIntercept() gin.HandlerFunc {
 		// 无图片 → 仅去后缀
 		if len(images) == 0 {
 			logger.LogInfo(c, fmt.Sprintf("[vision] no images found in %d messages", len(messagesRaw.Array())))
-			stripSuffixAndProceed(c, bodyBytes, strippedModel)
+			stripSuffixAndProceed(c, bodyBytes, strippedModel, false, settings)
 			return
 		}
 
@@ -115,7 +113,7 @@ func VisionIntercept() gin.HandlerFunc {
 		for i := range dedupMap {
 			dedupMap[i] = -1
 		}
-		dedupedImages := make([]ImageBlock, 0, len(images))
+		dedupedImages := make([]vision.ImageBlock, 0, len(images))
 		for i, img := range images {
 			if firstIdx, exists := seen[img.ImageURL]; exists {
 				dedupMap[i] = firstIdx
@@ -145,12 +143,12 @@ func VisionIntercept() gin.HandlerFunc {
 					sem <- struct{}{}
 					defer func() { <-sem }()
 
-					img, err := DecodeBase64Image(dedupedImages[idx].ImageURL)
+					img, err := vision.DecodeBase64Image(dedupedImages[idx].ImageURL)
 					if err != nil {
 						dedupedPhashes[idx] = phashResult{err: err}
 						return
 					}
-					hash, err := ComputePhash(img)
+					hash, err := vision.ComputePhash(img)
 					dedupedPhashes[idx] = phashResult{hash: hash, err: err}
 				}(i)
 			}
@@ -178,7 +176,7 @@ func VisionIntercept() gin.HandlerFunc {
 					if group.repPhash == nil {
 						continue
 					}
-					if HammingDistance(pr.hash, *group.repPhash) <= settings.PhashThreshold {
+					if vision.HammingDistance(pr.hash, *group.repPhash) <= settings.PhashThreshold {
 						groups[g].members = append(groups[g].members, i)
 						dedupToGroup[i] = g
 						found = true
@@ -240,7 +238,7 @@ func VisionIntercept() gin.HandlerFunc {
 				if groupHasNew[gi] {
 					ctx, cancel := context.WithTimeout(gctx, 30*time.Second)
 					defer cancel()
-					desc, cached, err := AnalyzeImage(c, ctx, *settings, dedupedImages[rep].ImageURL, requestID, groups[gi].repPhash)
+					desc, cached, err := vision.AnalyzeImage(c, ctx, *settings, dedupedImages[rep].ImageURL, requestID, groups[gi].repPhash)
 					if err != nil {
 						groupErrors[gi] = err
 						return nil
@@ -248,7 +246,7 @@ func VisionIntercept() gin.HandlerFunc {
 					groupDescriptions[gi] = desc
 					groupCached[gi] = cached
 				} else {
-					desc, found := LookupCachedDescription(dedupedImages[rep].ImageURL, *settings, groups[gi].repPhash)
+					desc, found := vision.LookupCachedDescription(dedupedImages[rep].ImageURL, *settings, groups[gi].repPhash)
 					if found {
 						groupDescriptions[gi] = desc
 						groupCached[gi] = true
@@ -330,7 +328,7 @@ func VisionIntercept() gin.HandlerFunc {
 				Type: dto.ContentTypeText,
 				Text: replacementText,
 			}
-			replacementJSON, err := common.Marshal(replacement)
+			replacementJSON, err := json.Marshal(replacement)
 			if err != nil {
 				abortWithVisionError(c, http.StatusInternalServerError, "failed to marshal replacement content")
 				return
@@ -348,18 +346,21 @@ func VisionIntercept() gin.HandlerFunc {
 
 		logger.LogInfo(c, fmt.Sprintf("[vision] replaced %d/%d images (%d failed)", replacedCount, len(images), failedCount))
 
-		stripSuffixAndProceed(c, bodyBytes, strippedModel)
+		stripSuffixAndProceed(c, bodyBytes, strippedModel, true, settings)
 	}
 }
 
 // stripSuffixAndProceed 设置模型名并继续——三个退出点的公共逻辑
-func stripSuffixAndProceed(c *gin.Context, body []byte, strippedModel string) {
+func stripSuffixAndProceed(c *gin.Context, body []byte, strippedModel string, markIntercepted bool, settings *dto.VisionUserSetting) {
 	modified, err := sjson.SetBytes(body, "model", strippedModel)
 	if err != nil {
 		abortWithVisionError(c, http.StatusInternalServerError, "failed to modify model name")
 		return
 	}
 	replaceBody(c, modified)
+	if markIntercepted {
+		c.Set("vision_intercepted", true)
+	}
 	c.Next()
 }
 
@@ -386,8 +387,8 @@ func hasClaudeImageRecursive(content gjson.Result) bool {
 	return false
 }
 
-func extractOpenAIImages(bodyBytes []byte) []ImageBlock {
-	var images []ImageBlock
+func extractOpenAIImages(bodyBytes []byte) []vision.ImageBlock {
+	var images []vision.ImageBlock
 	messages := gjson.GetBytes(bodyBytes, "messages").Array()
 
 	for msgIdx, msg := range messages {
@@ -400,7 +401,7 @@ func extractOpenAIImages(bodyBytes []byte) []ImageBlock {
 			case dto.ContentTypeImageURL:
 				imgURL := extractImageOrVideoURL(item, "image_url")
 				if imgURL != "" {
-					images = append(images, ImageBlock{
+					images = append(images, vision.ImageBlock{
 						MessageIdx: msgIdx,
 						ContentIdx: contentIdx,
 						ImageURL:   imgURL,
@@ -409,7 +410,7 @@ func extractOpenAIImages(bodyBytes []byte) []ImageBlock {
 			case dto.ContentTypeVideoUrl:
 				videoURL := extractImageOrVideoURL(item, "video_url")
 				if videoURL != "" {
-					images = append(images, ImageBlock{
+					images = append(images, vision.ImageBlock{
 						MessageIdx: msgIdx,
 						ContentIdx: contentIdx,
 						ImageURL:   videoURL,
@@ -430,8 +431,8 @@ func extractImageOrVideoURL(item gjson.Result, field string) string {
 	return val.String()
 }
 
-func extractClaudeImages(bodyBytes []byte) ([]ImageBlock, error) {
-	var images []ImageBlock
+func extractClaudeImages(bodyBytes []byte) ([]vision.ImageBlock, error) {
+	var images []vision.ImageBlock
 	messages := gjson.GetBytes(bodyBytes, "messages").Array()
 	for msgIdx, msg := range messages {
 		content := msg.Get("content")
@@ -442,7 +443,7 @@ func extractClaudeImages(bodyBytes []byte) ([]ImageBlock, error) {
 	return images, nil
 }
 
-func extractClaudeImagesRecursive(content gjson.Result, msgIdx int, pathPrefix string, images *[]ImageBlock) {
+func extractClaudeImagesRecursive(content gjson.Result, msgIdx int, pathPrefix string, images *[]vision.ImageBlock) {
 	for ci, item := range content.Array() {
 		itemType := item.Get("type").String()
 
@@ -468,7 +469,7 @@ func extractClaudeImagesRecursive(content gjson.Result, msgIdx int, pathPrefix s
 					}
 				}
 				if imgURL != "" {
-					*images = append(*images, ImageBlock{
+					*images = append(*images, vision.ImageBlock{
 						MessageIdx: msgIdx,
 						ContentIdx: ci,
 						NestedPath: currentPath,
@@ -514,15 +515,3 @@ func abortWithVisionError(c *gin.Context, statusCode int, message string) {
 	c.Abort()
 }
 
-
-func parseVisionSettings(userSetting dto.UserSetting) (*VisionUserSetting, bool) {
-	raw, ok := userSetting.Extensions["vision"]
-	if !ok || len(raw) == 0 {
-		return nil, false
-	}
-	var settings VisionUserSetting
-	if err := common.Unmarshal(raw, &settings); err != nil {
-		return nil, false
-	}
-	return &settings, true
-}

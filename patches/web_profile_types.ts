@@ -118,8 +118,24 @@ export interface UserSettings {
   upstream_model_update_notify_enabled?: boolean
   /** Preferred interface/API response language */
   language?: string
-  /** Plugin extension settings (e.g. vision) */
-  [key: string]: unknown
+  /** Vision interception settings */
+  vision?: VisionSettings
+}
+
+/**
+ * Vision interception settings
+ */
+export interface VisionSettings {
+  /** Enable vision interception */
+  enabled?: boolean
+  /** Vision model name (must match a model in the system marketplace) */
+  vision_model_name?: string
+  /** Prompt template for image description */
+  prompt_template?: string
+  /** Model suffix that triggers vision interception */
+  vision_suffix?: string
+  /** pHash hamming distance threshold for similar image grouping */
+  phash_threshold?: number
 }
 
 /**
@@ -147,8 +163,7 @@ export interface UpdateUserSettingsRequest {
   accept_unset_model_ratio_model?: boolean
   record_ip_log?: boolean
   upstream_model_update_notify_enabled?: boolean
-  /** Plugin extension settings (e.g. vision) */
-  [key: string]: unknown
+  vision?: VisionSettings
 }
 
 /**

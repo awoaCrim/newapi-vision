@@ -1,0 +1,17 @@
+# ============================================================
+# patches/go.mod.diff
+# 目标文件: <new-api>/go.mod
+# 说明: vision 新增依赖。go mod tidy 会自动补全间接依赖。
+# ============================================================
+
+# 直接依赖（require 块中增加，按字母序插入）
+	github.com/corona10/goimagehash v1.1.0
+
+# 间接依赖（go mod tidy 自动补上；此处为参考）
+	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646 // indirect
+
+# 其余依赖 new-api 已自带，无需改动：
+#   github.com/samber/hot v0.11.0
+#   github.com/samber/lo v1.52.0
+#   github.com/tidwall/gjson v1.18.0
+#   github.com/tidwall/sjson v1.2.5

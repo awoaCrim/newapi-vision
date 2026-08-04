@@ -1,0 +1,18 @@
+// ============================================================
+// patches/router_relay_router.go.snippet
+// 目标文件: <new-api>/router/relay-router.go
+// 说明: 本文件不是完整文件，仅列出需要手工合并的一处改动。
+// ============================================================
+
+// ------------------------------------------------------------
+// 改动 1/1: SetRelayRouter 函数中挂载 vision 中间件
+// 位置: httpRouter := relayV1Router.Group("") 之后、
+//       httpRouter.Use(middleware.Distribute()) 之前
+// ------------------------------------------------------------
+	{
+		//http router
+		httpRouter := relayV1Router.Group("")
+		httpRouter.Use(middleware.VisionIntercept())
+		httpRouter.Use(middleware.Distribute())
+		// ... 其余路由注册不变 ...
+	}

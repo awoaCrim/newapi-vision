@@ -31,15 +31,8 @@ import { ProfileSecurityCard } from './components/profile-security-card'
 import { ProfileSettingsCard } from './components/profile-settings-card'
 import { SidebarModulesCard } from './components/sidebar-modules-card'
 import { TwoFACard } from './components/two-fa-card'
+import { VisionSettingsCard } from './components/vision-settings-card'
 import { useProfile } from './hooks'
-import { lazy, Suspense } from 'react'
-import { Skeleton } from '@/components/ui/skeleton'
-
-const VisionSettingsCard = lazy(() =>
-  import('./components/vision-settings-card').then((m) => ({
-    default: m.VisionSettingsCard,
-  }))
-)
 
 export function Profile() {
   const { profile, loading, refreshProfile } = useProfile()
@@ -47,7 +40,6 @@ export function Profile() {
   const permissions = useAuthStore((s) => s.auth.user?.permissions)
 
   const checkinEnabled = status?.checkin_enabled === true
-  const visionEnabled = status?.vision_enabled === true
   const turnstileEnabled = !!(
     status?.turnstile_check && status?.turnstile_site_key
   )
@@ -70,14 +62,10 @@ export function Profile() {
                   loading={loading}
                   onProfileUpdate={refreshProfile}
                 />
-                {visionEnabled && (
-                  <Suspense fallback={<Skeleton className='h-48 w-full' />}>
-                    <VisionSettingsCard
-                      profile={profile}
-                      onSettingsUpdate={refreshProfile}
-                    />
-                  </Suspense>
-                )}
+                <VisionSettingsCard
+                  profile={profile}
+                  onSettingsUpdate={refreshProfile}
+                />
                 <LanguagePreferencesCard
                   profile={profile}
                   onProfileUpdate={refreshProfile}

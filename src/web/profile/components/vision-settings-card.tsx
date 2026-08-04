@@ -41,14 +41,6 @@ import { updateUserSettings } from '../api'
 import { parseUserSettings } from '../lib'
 import type { UserProfile } from '../types'
 
-interface VisionSettings {
-  enabled?: boolean
-  vision_model_name?: string
-  prompt_template?: string
-  vision_suffix?: string
-  phash_threshold?: number
-}
-
 interface VisionSettingsCardProps {
   profile: UserProfile | null
   onSettingsUpdate: () => void
@@ -70,8 +62,7 @@ export function VisionSettingsCard({
   const { t } = useTranslation()
 
   const existingSettings = parseUserSettings(profile?.setting)
-  const vision =
-    (existingSettings.vision as VisionSettings | undefined) ?? DEFAULT_VISION
+  const vision = existingSettings.vision ?? DEFAULT_VISION
 
   const [enabled, setEnabled] = useState(vision.enabled)
   const [modelName, setModelName] = useState(vision.vision_model_name)
@@ -82,7 +73,7 @@ export function VisionSettingsCard({
 
   useEffect(() => {
     const settings = parseUserSettings(profile?.setting)
-    const v = settings.vision as VisionSettings | undefined
+    const v = settings.vision
     if (v) {
       setEnabled(v.enabled)
       setModelName(v.vision_model_name)
@@ -105,11 +96,11 @@ export function VisionSettingsCard({
         phash_threshold: phashThreshold,
       }
       const res = await updateUserSettings(merged)
-      if (res.success) {
+      if (res.data?.success) {
         toast.success(t('Vision settings saved'))
         onSettingsUpdate()
       } else {
-        toast.error(res.message || t('Failed to save vision settings'))
+        toast.error(res.data?.message || t('Failed to save vision settings'))
       }
     } catch {
       toast.error(t('Failed to save vision settings'))

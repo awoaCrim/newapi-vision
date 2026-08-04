@@ -1,0 +1,25 @@
+// ============================================================
+// patches/controller_user.go.snippet
+// 目标文件: <new-api>/controller/user.go
+// 说明: 本文件不是完整文件，仅列出需要手工合并的两处改动。
+// ============================================================
+
+// ------------------------------------------------------------
+// 改动 1/2: UpdateUserSettingRequest 结构体
+// 位置: 在 RecordIpLog 字段之后增加 Vision 字段
+// ------------------------------------------------------------
+type UpdateUserSettingRequest struct {
+	// ... 既有字段 ...
+	RecordIpLog                      bool                  `json:"record_ip_log"`
+	Vision                           *dto.VisionUserSetting `json:"vision,omitempty"`
+}
+
+// ------------------------------------------------------------
+// 改动 2/2: UpdateUserSetting 函数
+// 位置: 在「合并上游模型更新通知设置」之后、
+//       settings.AcceptUnsetRatioModel = req.AcceptUnsetModelRatioModel 之前
+// ------------------------------------------------------------
+	// 合并视觉拦截设置
+	if req.Vision != nil {
+		settings.Vision = req.Vision
+	}

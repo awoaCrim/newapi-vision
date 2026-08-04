@@ -140,7 +140,7 @@ func HammingDistance(a, b uint64) int {
 
 // LookupCachedDescription 仅查询 L4/L2 缓存，不发起任何 API 调用
 // 用于历史消息中的旧图——有缓存则复用描述，无缓存则保留原图让模型直接查看
-func LookupCachedDescription(imageURL string, config VisionUserSetting, phash *uint64) (string, bool) {
+func LookupCachedDescription(imageURL string, config dto.VisionUserSetting, phash *uint64) (string, bool) {
 	// L4: 跨请求 pHash 模糊缓存
 	if phash != nil && config.PhashThreshold > 0 {
 		if desc, found := phashCache.lookup(*phash, config.PhashThreshold); found {
@@ -168,7 +168,7 @@ type visionCallResult struct {
 // requestID 用于请求级去重和防模型缓存
 // phash 为预计算的感知哈希，用于 L4 模糊缓存（nil 表示跳过 L4）
 // 返回描述文本和是否命中缓存，如果失败返回错误（必须严格失败，不允许返回空描述）
-func AnalyzeImage(c *gin.Context, ctx context.Context, config VisionUserSetting, imageURL string, requestID string, phash *uint64) (desc string, cached bool, err error) {
+func AnalyzeImage(c *gin.Context, ctx context.Context, config dto.VisionUserSetting, imageURL string, requestID string, phash *uint64) (desc string, cached bool, err error) {
 	if imageURL == "" {
 		return "", false, fmt.Errorf("empty image URL")
 	}
