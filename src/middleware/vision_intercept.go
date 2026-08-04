@@ -242,7 +242,7 @@ func VisionIntercept() gin.HandlerFunc {
 
 		// Phase C: 按组并行处理
 		// - 新图组：完整 AnalyzeImage（缓存 + API 调用）
-		// - 旧图组：仅查 L4/L2 缓存，无缓存则保留原图让模型直接查看
+		// - 旧图组：仅查 L4/L2 缓存，有缓存复用描述，无缓存用「未解析图片」占位符
 		groupDescriptions := make([]string, len(groups))
 		groupErrors := make([]error, len(groups))
 		groupCached := make([]bool, len(groups))
@@ -269,9 +269,9 @@ func VisionIntercept() gin.HandlerFunc {
 						groupDescriptions[gi] = desc
 						groupCached[gi] = true
 					} else {
-						// 旧图无缓存：不调 API，也不生成占位符——保留原图让上游自行处理，
-						// 避免历史视觉上下文被替换成无意义文本
-						groupDescriptions[gi] = ""
+						// 旧图无缓存：不调 API（省成本），替换为信息明确的占位符，
+						// 告知上游该图片尚未被解析，避免丢失上下文位置或误读内容
+						groupDescriptions[gi] = "[This image was not parsed — its visual content is unavailable]"
 						groupCached[gi] = true
 					}
 				}
