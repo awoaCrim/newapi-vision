@@ -5,7 +5,7 @@
 ## 功能
 
 - 用户级配置（个人资料页）：启用、视觉模型、后缀、prompt、pHash 阈值
-- 模型名加后缀（默认 -vision）触发拦截
+- 模型名加后缀（默认 `-vision`）触发拦截
 - OpenAI / Claude 消息格式；URL 去重 + pHash 聚类
 - 经系统模型广场渠道调用视觉模型并计费到当前用户
 - 分析失败严格返回错误（不静默降级）
@@ -13,7 +13,7 @@
 
 ## 目录
 
-\\\
+```
 src/
   middleware/vision_intercept.go   # 拦截中间件（复制到 new-api 的 middleware/）
   service/vision/vision.go         # 分析 / 缓存 / 计费（复制到 new-api 的 service/vision/）
@@ -28,11 +28,11 @@ patches/
   go.mod.diff                      # go.mod 依赖变更
 docs/
   integration.md                   # 详细合并步骤
-\\\
+```
 
 ## 合并到 new-api
 
-\\\ash
+```bash
 # 1. 复制新增源码
 cp src/middleware/vision_intercept.go <new-api>/middleware/
 cp -r src/service/vision <new-api>/service/vision
@@ -45,12 +45,12 @@ cp src/web/profile/components/vision-settings-card.tsx <new-api>/web/default/src
 
 # 3. 构建
 go mod tidy && go build -o new-api .
-\\\
+```
 
 ## 使用
 
 1. 个人资料 → Vision Interception → 开启并选择模型广场中的视觉模型
-2. 请求模型名加后缀，例如 minimax-m3-vision
+2. 请求模型名加后缀，例如 `minimax-m3-vision`
 3. 网关去掉后缀，用文字描述替换图片后再转发给目标模型
 
 ## License
