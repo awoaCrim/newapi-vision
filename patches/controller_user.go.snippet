@@ -19,7 +19,29 @@ type UpdateUserSettingRequest struct {
 // 位置: 在「合并上游模型更新通知设置」之后、
 //       settings.AcceptUnsetRatioModel = req.AcceptUnsetModelRatioModel 之前
 // ------------------------------------------------------------
-	// 合并视觉拦截设置
+	// 合并视觉拦截设置（含后端校验，防止绕过前端约束）
 	if req.Vision != nil {
+		v := req.Vision
+		if v.Enabled {
+			if strings.TrimSpace(v.VisionModelName) == "" {
+				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+				return
+			}
+			if strings.TrimSpace(v.VisionSuffix) == "" {
+				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+				return
+			}
+			if v.VisionSuffix == v.VisionModelName {
+				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+				return
+			}
+			if len(v.PromptTemplate) > 8000 {
+				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+				return
+			}
+		}
+		if v.PhashThreshold < 0 || v.PhashThreshold > 64 {
+			v.PhashThreshold = 0
+		}
 		settings.Vision = req.Vision
 	}

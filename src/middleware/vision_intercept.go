@@ -27,6 +27,15 @@ import (
 // VisionIntercept 视觉拦截中间件
 func VisionIntercept() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// 路由限制：仅对真正携带图片的 chat/completions 与 claude messages 生效，
+		// 避免对其他端点（embedding、音频等）做无意义的 body 解析与改写
+		switch c.Request.URL.Path {
+		case "/v1/chat/completions", "/v1/messages", "/chat/completions", "/messages":
+		default:
+			c.Next()
+			return
+		}
+
 		// 从用户设置读取视觉配置（用户级）
 		userSetting, exists := common.GetContextKeyType[dto.UserSetting](c, constant.ContextKeyUserSetting)
 		if !exists || userSetting.Vision == nil || !userSetting.Vision.Enabled || userSetting.Vision.VisionSuffix == "" {
@@ -125,8 +134,17 @@ func VisionIntercept() gin.HandlerFunc {
 			}
 		}
 
+		// 解码前的大小检查：data URI 超限直接拒绝，避免先解码大图再报错（防 DoS）
+		for _, img := range dedupedImages {
+			if strings.HasPrefix(img.ImageURL, "data:") && len(img.ImageURL) > vision.MaxBase64ImageBytes {
+				abortWithVisionError(c, http.StatusBadRequest, fmt.Sprintf("base64 image exceeds size limit (%d bytes)", vision.MaxBase64ImageBytes))
+				return
+			}
+		}
+
 		// Phase A: 并行计算 pHash（CPU 密集型，信号量限制 8 并发）
 		requestID := c.GetString(common.RequestIdKey)
+		userId := c.GetInt("id")
 
 		type phashResult struct {
 			hash uint64
@@ -246,13 +264,14 @@ func VisionIntercept() gin.HandlerFunc {
 					groupDescriptions[gi] = desc
 					groupCached[gi] = cached
 				} else {
-					desc, found := vision.LookupCachedDescription(dedupedImages[rep].ImageURL, *settings, groups[gi].repPhash)
+					desc, found := vision.LookupCachedDescription(userId, dedupedImages[rep].ImageURL, *settings, groups[gi].repPhash)
 					if found {
 						groupDescriptions[gi] = desc
 						groupCached[gi] = true
 					} else {
-						// 旧图无缓存：占位文本替代，既不调 API 也避免上游报错
-						groupDescriptions[gi] = "[Image]"
+						// 旧图无缓存：不调 API，也不生成占位符——保留原图让上游自行处理，
+						// 避免历史视觉上下文被替换成无意义文本
+						groupDescriptions[gi] = ""
 						groupCached[gi] = true
 					}
 				}
@@ -397,25 +416,17 @@ func extractOpenAIImages(bodyBytes []byte) []vision.ImageBlock {
 			continue
 		}
 		for contentIdx, item := range content.Array() {
-			switch item.Get("type").String() {
-			case dto.ContentTypeImageURL:
-				imgURL := extractImageOrVideoURL(item, "image_url")
-				if imgURL != "" {
-					images = append(images, vision.ImageBlock{
-						MessageIdx: msgIdx,
-						ContentIdx: contentIdx,
-						ImageURL:   imgURL,
-					})
-				}
-			case dto.ContentTypeVideoUrl:
-				videoURL := extractImageOrVideoURL(item, "video_url")
-				if videoURL != "" {
-					images = append(images, vision.ImageBlock{
-						MessageIdx: msgIdx,
-						ContentIdx: contentIdx,
-						ImageURL:   videoURL,
-					})
-				}
+			// 仅提取 image_url；video_url 无法由视觉模型描述，跳过以免误当图片发送
+			if item.Get("type").String() != dto.ContentTypeImageURL {
+				continue
+			}
+			imgURL := extractImageOrVideoURL(item, "image_url")
+			if imgURL != "" {
+				images = append(images, vision.ImageBlock{
+					MessageIdx: msgIdx,
+					ContentIdx: contentIdx,
+					ImageURL:   imgURL,
+				})
 			}
 		}
 	}

@@ -96,11 +96,11 @@ export function VisionSettingsCard({
         phash_threshold: phashThreshold,
       }
       const res = await updateUserSettings(merged)
-      if (res.data?.success) {
+      if (res.success) {
         toast.success(t('Vision settings saved'))
         onSettingsUpdate()
       } else {
-        toast.error(res.data?.message || t('Failed to save vision settings'))
+        toast.error(res.message || t('Failed to save vision settings'))
       }
     } catch {
       toast.error(t('Failed to save vision settings'))

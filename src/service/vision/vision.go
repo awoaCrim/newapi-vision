@@ -44,17 +44,30 @@ var imageDescCache = hot.NewHotCache[string, string](hot.LRU, 1000).
 	WithTTL(10 * time.Minute).Build()
 
 // requestCache 请求级去重：同一请求中相同图片只调一次视觉模型
-var requestCache = hot.NewHotCache[string, map[string]string](hot.LRU, 5000).
+// entry 内 map 受互斥锁保护，防止并发写入（多图并行分析时共享同一 entry）
+type requestCacheEntry struct {
+	mu sync.Mutex
+	m  map[string]string
+}
+
+var requestCache = hot.NewHotCache[string, *requestCacheEntry](hot.LRU, 5000).
 	WithTTL(5 * time.Minute).Build()
 
 // sfGroup 全局 singleflight：同一图片并发请求合并为一次 API 调用，防止缓存击穿
 var sfGroup singleflight.Group
 
 // L4: 跨请求 pHash 模糊缓存 —— 相似图片复用描述
+// entry 记录用户、视觉模型与 prompt 哈希，防止跨用户/跨模型/跨 prompt 串用
 type phashEntry struct {
-	hash uint64
-	desc string
+	userId     int
+	model      string
+	promptHash string
+	hash       uint64
+	desc       string
+	ts         int64 // 写入时间戳，用于 TTL 过期
 }
+
+const phashCacheTTL = 10 * time.Minute
 
 type phashRingCache struct {
 	mu      sync.RWMutex
@@ -70,26 +83,31 @@ func newPhashRingCache(max int) *phashRingCache {
 	}
 }
 
-func (c *phashRingCache) lookup(hash uint64, threshold int) (string, bool) {
+func (c *phashRingCache) lookup(userId int, model string, promptHash string, hash uint64, threshold int) (string, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	n := c.count
 	if n > c.max {
 		n = c.max
 	}
+	now := time.Now().Unix()
 	for i := 0; i < n; i++ {
-		if bits.OnesCount64(c.entries[i].hash^hash) <= threshold {
-			return c.entries[i].desc, true
+		e := c.entries[i]
+		if now-e.ts > int64(phashCacheTTL.Seconds()) {
+			continue // 过期条目视为未命中
+		}
+		if e.userId == userId && e.model == model && e.promptHash == promptHash && bits.OnesCount64(e.hash^hash) <= threshold {
+			return e.desc, true
 		}
 	}
 	return "", false
 }
 
-func (c *phashRingCache) store(hash uint64, desc string) {
+func (c *phashRingCache) store(userId int, model string, promptHash string, hash uint64, desc string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	idx := c.count % c.max
-	c.entries[idx] = phashEntry{hash: hash, desc: desc}
+	c.entries[idx] = phashEntry{userId: userId, model: model, promptHash: promptHash, hash: hash, desc: desc, ts: time.Now().Unix()}
 	c.count++ // 自然递增无界溢出，idx = count % max 自动绕回，构成真正的环形缓冲
 }
 
@@ -104,9 +122,13 @@ type ImageBlock struct {
 	MediaType  string // 图片 MIME 类型，如 "image/png"
 }
 
-const maxBase64ImageBytes = 20 * 1024 * 1024 // 20MB
+const MaxBase64ImageBytes = 20 * 1024 * 1024 // 20MB
+const maxDecodedImageBytes = 15 * 1024 * 1024 // 15MB，base64 解码后上限（约等于 20MB 编码串）
+const maxImageDimension = 16384          // 单边最大像素
+const maxImagePixels = 80 * 1000 * 1000  // 总像素上限（约 80MP），防止解码时内存暴涨
 
 // DecodeBase64Image 解析 data: URI 并解码 base64 为 image.Image
+// 解码前先读取图片头检查尺寸与像素上限，并限制解码输出字节数，防止超大图片触发内存 DoS
 func DecodeBase64Image(dataURI string) (image.Image, error) {
 	if !strings.HasPrefix(dataURI, "data:") {
 		return nil, fmt.Errorf("not a data URI")
@@ -116,11 +138,31 @@ func DecodeBase64Image(dataURI string) (image.Image, error) {
 		return nil, fmt.Errorf("invalid data URI: missing comma")
 	}
 	b64Data := dataURI[commaIdx+1:]
-	reader := base64.NewDecoder(base64.StdEncoding, strings.NewReader(b64Data))
-	img, _, err := image.Decode(reader)
+	decoder := base64.NewDecoder(base64.StdEncoding, strings.NewReader(b64Data))
+	limited := io.LimitReader(decoder, maxDecodedImageBytes+1)
+
+	// 先读图片头，校验尺寸与像素上限（DecodeConfig 只解析头部，不分配全图内存）
+	cfg, format, err := image.DecodeConfig(limited)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read image header from base64: %w", err)
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return nil, fmt.Errorf("invalid image dimensions: %dx%d", cfg.Width, cfg.Height)
+	}
+	if cfg.Width > maxImageDimension || cfg.Height > maxImageDimension {
+		return nil, fmt.Errorf("image dimensions %dx%d exceed limit %d", cfg.Width, cfg.Height, maxImageDimension)
+	}
+	if cfg.Width*cfg.Height > maxImagePixels {
+		return nil, fmt.Errorf("image pixel count %d exceeds limit %d", cfg.Width*cfg.Height, maxImagePixels)
+	}
+
+	// 重新解码完整图片（decoder 是流式的，需重建 reader）
+	decoder2 := base64.NewDecoder(base64.StdEncoding, strings.NewReader(b64Data))
+	img, _, err := image.Decode(io.LimitReader(decoder2, maxDecodedImageBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode image from base64: %w", err)
 	}
+	_ = format
 	return img, nil
 }
 
@@ -140,15 +182,17 @@ func HammingDistance(a, b uint64) int {
 
 // LookupCachedDescription 仅查询 L4/L2 缓存，不发起任何 API 调用
 // 用于历史消息中的旧图——有缓存则复用描述，无缓存则保留原图让模型直接查看
-func LookupCachedDescription(imageURL string, config dto.VisionUserSetting, phash *uint64) (string, bool) {
+// 缓存键包含 userId/model/prompt，杜绝跨用户与跨模型串用
+func LookupCachedDescription(userId int, imageURL string, config dto.VisionUserSetting, phash *uint64) (string, bool) {
 	// L4: 跨请求 pHash 模糊缓存
 	if phash != nil && config.PhashThreshold > 0 {
-		if desc, found := phashCache.lookup(*phash, config.PhashThreshold); found {
+		promptHash := hashPrompt(config.PromptTemplate)
+		if desc, found := phashCache.lookup(userId, config.VisionModelName, promptHash, *phash, config.PhashThreshold); found {
 			return desc, true
 		}
 	}
 	// L2: 全局 LRU 缓存（exact URL match）
-	cacheKey := hashImageURL(imageURL, config.PromptTemplate)
+	cacheKey := buildCacheKey(userId, imageURL, config)
 	if desc, found, _ := imageDescCache.Get(cacheKey); found {
 		return desc, true
 	}
@@ -173,9 +217,12 @@ func AnalyzeImage(c *gin.Context, ctx context.Context, config dto.VisionUserSett
 		return "", false, fmt.Errorf("empty image URL")
 	}
 
+	userId := c.GetInt("id")
+
 	// L4: 跨请求 pHash 模糊缓存（在 L1 之前检查，缓存范围更广）
+	promptHash := hashPrompt(config.PromptTemplate)
 	if phash != nil && config.PhashThreshold > 0 {
-		if desc, found := phashCache.lookup(*phash, config.PhashThreshold); found {
+		if desc, found := phashCache.lookup(userId, config.VisionModelName, promptHash, *phash, config.PhashThreshold); found {
 			storeInRequestCache(requestID, imageURL, desc)
 			return desc, true, nil
 		}
@@ -183,15 +230,18 @@ func AnalyzeImage(c *gin.Context, ctx context.Context, config dto.VisionUserSett
 
 	// L1：请求级去重 —— 同一 requestID 中同一 URL 只调一次
 	if requestID != "" {
-		if reqMap, found, _ := requestCache.Get(requestID); found && reqMap != nil {
-			if desc, exists := reqMap[imageURL]; exists {
+		if entry, found, _ := requestCache.Get(requestID); found && entry != nil {
+			entry.mu.Lock()
+			desc, exists := entry.m[imageURL]
+			entry.mu.Unlock()
+			if exists {
 				return desc, true, nil
 			}
 		}
 	}
 
-	// L2：全局 LRU 缓存 —— 跨请求复用（key 包含 prompt hash，不同 prompt 不互串）
-	cacheKey := hashImageURL(imageURL, config.PromptTemplate)
+	// L2：全局 LRU 缓存 —— 跨请求复用（key 含 userId/model/prompt/完整图片哈希，不同用户不互串）
+	cacheKey := buildCacheKey(userId, imageURL, config)
 	if desc, found, _ := imageDescCache.Get(cacheKey); found {
 		// 存入请求级缓存
 		storeInRequestCache(requestID, imageURL, desc)
@@ -200,8 +250,8 @@ func AnalyzeImage(c *gin.Context, ctx context.Context, config dto.VisionUserSett
 
 	// 图片大小限制（data: URI 格式）
 	if strings.HasPrefix(imageURL, "data:") {
-		if len(imageURL) > maxBase64ImageBytes {
-			return "", false, fmt.Errorf("base64 image exceeds size limit (%d bytes)", maxBase64ImageBytes)
+		if len(imageURL) > MaxBase64ImageBytes {
+			return "", false, fmt.Errorf("base64 image exceeds size limit (%d bytes)", MaxBase64ImageBytes)
 		}
 	}
 
@@ -218,7 +268,8 @@ func AnalyzeImage(c *gin.Context, ctx context.Context, config dto.VisionUserSett
 		promptText = promptText + "\n[context_id:" + requestID + "]"
 	}
 
-	// L3: singleflight —— 同一图片的并发 API 调用合并为一次，防止缓存击穿
+	// L3: singleflight —— 同一用户+模型+图片的并发 API 调用合并为一次，防止缓存击穿
+	// key 含用户/模型维度，不同用户的请求不会合并计费
 	callResult, err, shared := sfGroup.Do(cacheKey, func() (interface{}, error) {
 		// 查找通道：从系统模型广场中选取支持 vision 模型的通道
 		tokenGroup := common.GetContextKeyString(c, constant.ContextKeyTokenGroup)
@@ -251,6 +302,32 @@ func AnalyzeImage(c *gin.Context, ctx context.Context, config dto.VisionUserSett
 			userCache.WriteContext(visionCtx)
 		}
 		visionCtx.Set("id", userId)
+
+		// 2.1 继承原请求的 token/group 计费上下文，保证视觉调用按同一 token 与分组计费
+		// （WriteContext 仅复制用户级字段，不复制 token 限额、token key、实际使用分组等）
+		for _, k := range []constant.ContextKey{
+			constant.ContextKeyTokenId,
+			constant.ContextKeyTokenKey,
+			constant.ContextKeyTokenUnlimited,
+			constant.ContextKeyTokenGroup,
+			constant.ContextKeyTokenCrossGroupRetry,
+			constant.ContextKeyTokenSpecificChannelId,
+			constant.ContextKeyTokenModelLimitEnabled,
+			constant.ContextKeyTokenModelLimit,
+			constant.ContextKeyUsingGroup,
+			constant.ContextKeyAutoGroup,
+			constant.ContextKeyAutoGroupIndex,
+			constant.ContextKeyAutoGroupRetryIndex,
+			constant.ContextKeyUserQuota,
+			constant.ContextKeyUserStatus,
+			constant.ContextKeyUserEmail,
+			constant.ContextKeyUserName,
+			constant.ContextKeyUserSetting,
+		} {
+			if v, exists := common.GetContextKey(c, k); exists {
+				common.SetContextKey(visionCtx, k, v)
+			}
+		}
 
 		// 3. 注入渠道上下文（内联 SetupContextForSelectedChannel 逻辑，避免循环依赖）
 		visionCtx.Set("original_model", config.VisionModelName)
@@ -420,9 +497,9 @@ func AnalyzeImage(c *gin.Context, ctx context.Context, config dto.VisionUserSett
 	vcr := callResult.(*visionCallResult)
 	description := vcr.description
 
-	// 存入 L4 pHash 缓存（跨请求模糊匹配）
+	// 存入 L4 pHash 缓存（跨请求模糊匹配，限同用户+模型+prompt）
 	if !shared && phash != nil && config.PhashThreshold > 0 {
-		phashCache.store(*phash, description)
+		phashCache.store(userId, config.VisionModelName, promptHash, *phash, description)
 	}
 
 	// 存入两级缓存（仅第一个调用者写入，shared=false 时执行，防止并发写）
@@ -453,35 +530,34 @@ func truncateBytes(data []byte, maxLen int) string {
 	return s
 }
 
-// hashImageURL 对图片 URL + prompt 做轻量哈希
-// 只取前 256 字节避免对大 base64 做全量哈希
-// prompt 参与 hash 确保不同 prompt 模板不共享缓存
-func hashImageURL(imageURL string, promptTemplate string) string {
-	key := imageURL
-	if len(key) > 256 {
-		key = key[:256]
-	}
-	// 混入 prompt（取前 100 字节）
-	if len(promptTemplate) > 100 {
-		key += promptTemplate[:100]
-	} else {
-		key += promptTemplate
-	}
-	h := md5.Sum([]byte(key))
+// hashPrompt 对 prompt 模板做完整哈希（不截断，避免不同 prompt 碰撞）
+func hashPrompt(promptTemplate string) string {
+	h := md5.Sum([]byte(promptTemplate))
 	return hex.EncodeToString(h[:])
 }
 
+// buildCacheKey 构造 L2/L3 缓存键：用户 + 视觉模型 + prompt 哈希 + 完整图片哈希。
+// 不做前缀截断，避免不同图片/不同 prompt 碰撞；包含用户与模型维度，杜绝跨用户串用。
+func buildCacheKey(userId int, imageURL string, config dto.VisionUserSetting) string {
+	imgHash := md5.Sum([]byte(imageURL))
+	promptHash := md5.Sum([]byte(config.PromptTemplate))
+	return fmt.Sprintf("%d|%s|%s|%s", userId, config.VisionModelName, hex.EncodeToString(promptHash[:]), hex.EncodeToString(imgHash[:]))
+}
+
 // storeInRequestCache 将描述存入请求级缓存，同一请求中相同 URL 直接复用
+// 使用互斥锁保护 map，避免多图并行分析时的并发写入
 func storeInRequestCache(requestID string, imageURL string, desc string) {
 	if requestID == "" {
 		return
 	}
-	reqMap, found, _ := requestCache.Get(requestID)
-	if !found || reqMap == nil {
-		reqMap = make(map[string]string)
+	entry, found, _ := requestCache.Get(requestID)
+	if !found || entry == nil {
+		entry = &requestCacheEntry{m: make(map[string]string)}
+		requestCache.Set(requestID, entry)
 	}
-	reqMap[imageURL] = desc
-	requestCache.Set(requestID, reqMap)
+	entry.mu.Lock()
+	entry.m[imageURL] = desc
+	entry.mu.Unlock()
 }
 
 // validateImageURL 校验图片 URL，使用系统 FetchSettings 防止 SSRF 攻击
