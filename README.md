@@ -2,17 +2,89 @@
 
 在请求到达目标模型前，把图片转成文字描述，让纯文本模型也能「看图」。
 
-## 功能
-
-- 用户级配置（个人资料页）：启用、视觉模型、后缀、prompt、pHash 阈值
-- 模型名加后缀（默认 `-vision`）触发拦截
-- OpenAI / Claude 消息格式；URL 图片下载并参与 pHash（SSRF 校验 + 大小/维度限制）
-- 经系统模型广场渠道调用视觉模型并计费到当前用户
-- 独立子计费生命周期：预扣 / 成功结算 / 失败自动退款（走 new-api 标准计费主路径，按视觉模型计费）
-- 分析失败严格返回错误；旧图无缓存数据时返回占位符文本，不静默降级
-- 多层缓存：请求级去重（L1）、全局 LRU（L2）、singleflight（L3）、pHash 模糊缓存（L4），缓存键按用户 + 模型隔离
+[![Base](https://img.shields.io/badge/base-new--api-green)](https://github.com/QuantumNous/new-api)
+[![Suffix](https://img.shields.io/badge/model%20suffix--vision-blue)]()
+[![License](https://img.shields.io/badge/license-AGPL--3.0-orange)](https://github.com/QuantumNous/new-api/blob/main/LICENSE)
 
 ## 目录
+
+- [简介](#简介)
+- [特性](#特性)
+- [工作原理](#工作原理)
+- [合并到 new-api](#合并到-new-api)
+- [使用](#使用)
+- [目录结构](#目录结构)
+- [限制与注意](#限制与注意)
+- [许可证](#许可证)
+- [致谢](#致谢)
+
+## 简介
+
+这是 new-api 的扩展：当请求的模型名带 `-vision` 后缀时，网关先拦截请求，把消息中的图片（base64 或 URL）交给配置的视觉模型转成文字描述，再以纯文本请求转发给目标模型。用户请求的目标模型保持不变，网关只替换消息内容。
+
+典型场景：只有纯文本模型的通道/额度，却要处理带图请求；或希望多模态输入统一收敛到文本通道。
+
+## 特性
+
+| 特性 | 说明 |
+|------|------|
+| 用户级配置 | 个人资料页开关：启用、视觉模型、后缀、prompt、pHash 阈值 |
+| 模型名触发 | 请求模型名带后缀（默认 `-vision`）即拦截，去后缀后转发 |
+| 消息格式 | OpenAI / Claude 两种消息格式均支持 |
+| URL 图片 | 自动下载并参与 pHash 查重，含 SSRF 校验与大小 / 维度限制 |
+| 标准计费 | 独立子计费生命周期：预扣 / 成功结算 / 失败自动退款，走 new-api 标准计费主路径，按视觉模型计费 |
+| 严格失败 | 分析失败返回错误，不静默降级；旧图无缓存数据时返回占位符文本 |
+| 多层缓存 | L1 请求级去重、L2 全局 LRU、L3 singleflight、L4 pHash 模糊缓存，缓存键按用户 + 模型隔离 |
+
+## 工作原理
+
+```
+请求（model: xxx-vision，含图片）
+  │
+  ▼
+vision_intercept.go 中间件
+  ├─ 模型名去后缀，标记 ContextKeyVisionIntercepted
+  ├─ 提取图片：base64 解码 / URL 下载（SSRF 校验 + 大小限制）
+  ├─ 计算 pHash → 查 L1~L4 缓存 → 未命中进入模型广场
+  └─ 走用户通道调用视觉模型，得到文字描述
+  │
+  ▼
+消息中的图片替换为描述文本 → 转发目标模型
+  │
+  ▼
+标准计费：预扣 → 成功结算（PostTextConsumeQuota）/ 失败自动退款（Refund）
+```
+
+## 合并到 new-api
+
+前置：一份可编译的 new-api 源码（Go 版本满足 go.mod 要求）。
+
+```bash
+# 1. 复制新增源码
+cp src/middleware/vision_intercept.go <new-api>/middleware/
+cp -r src/service/vision <new-api>/service/vision
+cp src/web/profile/components/vision-settings-card.tsx \
+   <new-api>/web/default/src/features/profile/components/
+
+# 2. 按 patches/ 修改既有文件
+#    dto/user_settings.go、constant/context_key.go、controller/user.go、
+#    router/relay-router.go、web/types.ts、web/index.tsx、go.mod
+
+# 3. 构建
+go mod tidy && go build -o new-api .
+```
+
+patches/ 约定：完整新文件可直接复制；`.snippet` / `.diff` 是既有文件的修改片段，需按注释手工应用。
+
+## 使用
+
+1. 个人资料页 → Vision Interception → 启用，选择模型广场中的视觉模型，按需调整 prompt 与 pHash 阈值
+2. 请求时模型名加后缀，例如 `minimax-m3-vision`
+3. 网关去掉后缀，用文字描述替换图片后再转发
+
+pHash 阈值（0 ~ 100）：越低越宽松，越容易被判定为相似图片；相同 pHash 的图片命中缓存后不再重复调用视觉模型。
+
+## 目录结构
 
 ```
 src/
@@ -27,36 +99,19 @@ patches/
   web_profile_types.ts             # 完整新文件（含 VisionSettings）
   web_profile_index.tsx            # 完整新文件（挂载设置卡片）
   go.mod.diff                      # go.mod 依赖变更
-docs/
-  integration.md                   # 详细合并步骤
 ```
 
-## 合并到 new-api
+## 限制与注意
 
-```bash
-# 1. 复制新增源码
-cp src/middleware/vision_intercept.go <new-api>/middleware/
-cp -r src/service/vision <new-api>/service/vision
-cp src/web/profile/components/vision-settings-card.tsx <new-api>/web/default/src/features/profile/components/
+- **URL 图片**：仅接受 http/https，经 SSRF 校验；超限或解析失败会返回错误，可换 base64 或直接关闭
+- **占位符**：旧图（缓存建立前）返回占位符文本，仍会正常计费主请求
+- **分析失败**：严格返回错误，不会把原始图片透传给纯文本模型
+- **缓存隔离**：缓存键含用户与目标模型，不同用户 / 模型之间互不共享
+- **计费**：视觉分析按视觉模型价格走标准计费主路径，主请求仍按目标模型结算；订阅用户遵循 new-api 标准接口默认行为
 
-# 2. 按 patches/ 修改既有文件（详见 docs/integration.md）
-#    dto/user_settings.go、constant/context_key.go、
-#    controller/user.go、router/relay-router.go、
-#    web/types.ts、web/index.tsx、go.mod
+## 许可证
 
-# 3. 构建
-go mod tidy && go build -o new-api .
-```
-
-## 使用
-
-1. 个人资料 → Vision Interception → 开启并选择模型广场中的视觉模型
-2. 请求模型名加后缀，例如 `minimax-m3-vision`
-3. 网关去掉后缀，用文字描述替换图片后再转发给目标模型
-
-## License
-
-与 new-api 一致（AGPL-3.0）。本代码用于在兼容宿主上扩展功能。
+与 new-api 一致（AGPL-3.0），完整文本见 [upstream LICENSE](https://github.com/QuantumNous/new-api/blob/main/LICENSE)。
 
 ## 致谢
 
