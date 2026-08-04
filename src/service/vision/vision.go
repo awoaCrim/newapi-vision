@@ -23,6 +23,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -255,7 +256,10 @@ func LookupCachedDescription(userId int, imageURL string, config dto.VisionUserS
 
 // visionCallResult 封装 vision API 调用的返回数据
 type visionCallResult struct {
-	description string
+	description      string
+	promptTokens     int
+	completionTokens int
+	totalTokens      int
 }
 
 // AnalyzeImage 调用视觉模型获取图片的文字描述
@@ -442,6 +446,30 @@ func AnalyzeImage(c *gin.Context, ctx context.Context, config dto.VisionUserSett
 			return nil, fmt.Errorf("failed to map model for vision: %w", mapErr)
 		}
 
+		// 6.1 独立子计费生命周期：估算价格 → 预扣费（遵循用户计费偏好，含订阅）
+		// 与主请求解耦，视觉调用作为独立 BillingSession 结算，避免重复计费
+		meta := &types.TokenCountMeta{
+			MaxTokens: int(lo.FromPtrOr(request.MaxTokens, uint(0))),
+		}
+		estTokens := service.CountTextToken(promptText, config.VisionModelName)
+		info.SetEstimatePromptTokens(estTokens)
+		priceData, priceErr := helper.ModelPriceHelper(visionCtx, info, estTokens, meta)
+		if priceErr != nil {
+			return nil, fmt.Errorf("failed to calculate vision model price: %w", priceErr)
+		}
+		info.PriceData = priceData
+		if !priceData.FreeModel {
+			if apiErr := service.PreConsumeBilling(visionCtx, priceData.QuotaToPreConsume, info); apiErr != nil {
+				return nil, fmt.Errorf("pre-consume billing failed for vision model '%s': %v", config.VisionModelName, apiErr)
+			}
+			// 请求失败或未产生结算时自动退款（成功结算后 NeedsRefund 返回 false，不重复退款）
+			defer func() {
+				if info.Billing != nil && info.Billing.NeedsRefund() {
+					info.Billing.Refund(visionCtx)
+				}
+			}()
+		}
+
 		// 7. 获取 adaptor
 		apiType, _ := common.ChannelType2APIType(channel.Type)
 		adaptor := relay.GetAdaptor(apiType)
@@ -484,7 +512,7 @@ func AnalyzeImage(c *gin.Context, ctx context.Context, config dto.VisionUserSett
 		}
 
 		// 10. 解析响应
-		_, respErr := adaptor.DoResponse(visionCtx, httpResp, info)
+		usageA, respErr := adaptor.DoResponse(visionCtx, httpResp, info)
 		if respErr != nil {
 			return nil, fmt.Errorf("failed to parse vision response: %s", respErr.Error())
 		}
@@ -517,9 +545,28 @@ func AnalyzeImage(c *gin.Context, ctx context.Context, config dto.VisionUserSett
 			return nil, fmt.Errorf("vision model returned empty description")
 		}
 
-		// 计费：视觉调用不产生独立计费，成本并入主请求（由主请求按主模型结算）
+		// 提取 usage 用于计费
+		var promptTokens, completionTokens, totalTokens int
+		usage, _ := usageA.(*dto.Usage)
+		if usage != nil {
+			promptTokens = usage.PromptTokens
+			completionTokens = usage.CompletionTokens
+			totalTokens = usage.TotalTokens
+		}
+
+		// 计费：通过 PostTextConsumeQuota 使用标准计费逻辑（含模型价格、倍率、分组比例）
+		if userId > 0 && totalTokens > 0 {
+			info.IsStream = false
+			service.PostTextConsumeQuota(visionCtx, info, usage, []string{"[vision] " + truncateString(description, 200)})
+			logger.LogInfo(c, fmt.Sprintf("[vision] billed via PostTextConsumeQuota (model=%s, channel=%d, tokens=%d)",
+				config.VisionModelName, channel.Id, totalTokens))
+		}
+
 		return &visionCallResult{
-			description: description,
+			description:      description,
+			promptTokens:     promptTokens,
+			completionTokens: completionTokens,
+			totalTokens:      totalTokens,
 		}, nil
 	})
 	if err != nil {
@@ -540,10 +587,18 @@ func AnalyzeImage(c *gin.Context, ctx context.Context, config dto.VisionUserSett
 	}
 	storeInRequestCache(requestID, imageURL, description)
 
-	// singleflight 共享用户：shared=true 表示本次调用被合并，实际 API 调用由第一个请求者执行，
-	// 视觉描述不重复产生（同一图片只解析一次）
+	// singleflight 共享用户：shared=true 表示本次调用被合并，
+	// 实际 API 调用由第一个请求者通过 PostTextConsumeQuota 付费，
+	// 共享用户不重复扣费（同一 API 调用只应收费一次）
 
 	return description, false, nil
+}
+
+func truncateString(s string, maxLen int) string {
+	if len(s) > maxLen {
+		return s[:maxLen] + "..."
+	}
+	return s
 }
 
 func truncateBytes(data []byte, maxLen int) string {
