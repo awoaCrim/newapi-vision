@@ -22,16 +22,27 @@ type UpdateUserSettingRequest struct {
 	// 合并视觉拦截设置（含后端校验，防止绕过前端约束）
 	if req.Vision != nil {
 		v := req.Vision
+		// trim 后保存，避免前后空格导致的后缀/模型名不匹配
+		v.VisionModelName = strings.TrimSpace(v.VisionModelName)
+		v.VisionSuffix = strings.TrimSpace(v.VisionSuffix)
 		if v.Enabled {
-			if strings.TrimSpace(v.VisionModelName) == "" {
+			if v.VisionModelName == "" {
 				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 				return
 			}
-			if strings.TrimSpace(v.VisionSuffix) == "" {
+			if v.VisionSuffix == "" {
+				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+				return
+			}
+			if len(v.VisionSuffix) > 64 {
 				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 				return
 			}
 			if v.VisionSuffix == v.VisionModelName {
+				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+				return
+			}
+			if strings.TrimSpace(v.PromptTemplate) == "" {
 				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 				return
 			}

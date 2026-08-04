@@ -53,6 +53,9 @@ type requestCacheEntry struct {
 var requestCache = hot.NewHotCache[string, *requestCacheEntry](hot.LRU, 5000).
 	WithTTL(5 * time.Minute).Build()
 
+// requestCacheInitMu 保护 requestCache entry 的创建，避免并发 miss 时创建多个 entry 互相覆盖
+var requestCacheInitMu sync.Mutex
+
 // sfGroup 全局 singleflight：同一图片并发请求合并为一次 API 调用，防止缓存击穿
 var sfGroup singleflight.Group
 
@@ -124,8 +127,9 @@ type ImageBlock struct {
 
 const MaxBase64ImageBytes = 20 * 1024 * 1024 // 20MB
 const maxDecodedImageBytes = 15 * 1024 * 1024 // 15MB，base64 解码后上限（约等于 20MB 编码串）
-const maxImageDimension = 16384          // 单边最大像素
-const maxImagePixels = 80 * 1000 * 1000  // 总像素上限（约 80MP），防止解码时内存暴涨
+const maxImageDimension = 8192            // 单边最大像素
+const maxImagePixels = 20 * 1000 * 1000   // 总像素上限（约 20MP），防止解码时内存暴涨
+const maxImageDownloadBytes = 15 * 1024 * 1024 // URL 图片下载上限（15MB）
 
 // DecodeBase64Image 解析 data: URI 并解码 base64 为 image.Image
 // 解码前先读取图片头检查尺寸与像素上限，并限制解码输出字节数，防止超大图片触发内存 DoS
@@ -146,14 +150,8 @@ func DecodeBase64Image(dataURI string) (image.Image, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read image header from base64: %w", err)
 	}
-	if cfg.Width <= 0 || cfg.Height <= 0 {
-		return nil, fmt.Errorf("invalid image dimensions: %dx%d", cfg.Width, cfg.Height)
-	}
-	if cfg.Width > maxImageDimension || cfg.Height > maxImageDimension {
-		return nil, fmt.Errorf("image dimensions %dx%d exceed limit %d", cfg.Width, cfg.Height, maxImageDimension)
-	}
-	if cfg.Width*cfg.Height > maxImagePixels {
-		return nil, fmt.Errorf("image pixel count %d exceeds limit %d", cfg.Width*cfg.Height, maxImagePixels)
+	if err := validateImageSize(cfg); err != nil {
+		return nil, err
 	}
 
 	// 重新解码完整图片（decoder 是流式的，需重建 reader）
@@ -164,6 +162,63 @@ func DecodeBase64Image(dataURI string) (image.Image, error) {
 	}
 	_ = format
 	return img, nil
+}
+
+// DownloadImageForPhash 安全下载 URL 图片用于 pHash 计算：
+// SSRF 校验（validateImageURL）→ Content-Length 限制 → 流式读取大小限制 → 尺寸/像素上限
+func DownloadImageForPhash(imageURL string) (image.Image, error) {
+	if err := validateImageURL(imageURL); err != nil {
+		return nil, err
+	}
+
+	resp, err := service.GetHttpClient().Get(imageURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("image download returned status %d", resp.StatusCode)
+	}
+	if resp.ContentLength > maxImageDownloadBytes {
+		return nil, fmt.Errorf("image download exceeds size limit (%d bytes)", maxImageDownloadBytes)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxImageDownloadBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read image body: %w", err)
+	}
+	if len(data) > maxImageDownloadBytes {
+		return nil, fmt.Errorf("image download exceeds size limit (%d bytes)", maxImageDownloadBytes)
+	}
+
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read image header from URL: %w", err)
+	}
+	if err := validateImageSize(cfg); err != nil {
+		return nil, err
+	}
+
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode image from URL: %w", err)
+	}
+	return img, nil
+}
+
+// validateImageSize 校验图片宽高与总像素上限
+func validateImageSize(cfg image.Config) error {
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return fmt.Errorf("invalid image dimensions: %dx%d", cfg.Width, cfg.Height)
+	}
+	if cfg.Width > maxImageDimension || cfg.Height > maxImageDimension {
+		return fmt.Errorf("image dimensions %dx%d exceed limit %d", cfg.Width, cfg.Height, maxImageDimension)
+	}
+	if cfg.Width*cfg.Height > maxImagePixels {
+		return fmt.Errorf("image pixel count %d exceeds limit %d", cfg.Width*cfg.Height, maxImagePixels)
+	}
+	return nil
 }
 
 // ComputePhash 计算图片的感知哈希 (uint64)
@@ -391,6 +446,30 @@ func AnalyzeImage(c *gin.Context, ctx context.Context, config dto.VisionUserSett
 			return nil, fmt.Errorf("failed to map model for vision: %w", mapErr)
 		}
 
+		// 6.1 独立子计费生命周期：估算价格 → 预扣费（遵循用户计费偏好，含订阅）
+		// 与主请求解耦，视觉调用作为独立 BillingSession 结算，避免重复计费
+		meta := &types.TokenCountMeta{
+			MaxTokens: int(lo.FromPtrOr(request.MaxTokens, uint(0))),
+		}
+		estTokens := service.CountTextToken(promptText, config.VisionModelName)
+		info.SetEstimatePromptTokens(estTokens)
+		priceData, priceErr := helper.ModelPriceHelper(visionCtx, info, estTokens, meta)
+		if priceErr != nil {
+			return nil, fmt.Errorf("failed to calculate vision model price: %w", priceErr)
+		}
+		info.PriceData = priceData
+		if !priceData.FreeModel {
+			if apiErr := service.PreConsumeBilling(visionCtx, priceData.QuotaToPreConsume, info); apiErr != nil {
+				return nil, fmt.Errorf("pre-consume billing failed for vision model '%s': %v", config.VisionModelName, apiErr)
+			}
+			// 请求失败或未产生结算时自动退款（成功结算后 NeedsRefund 返回 false，不重复退款）
+			defer func() {
+				if info.Billing != nil && info.Billing.NeedsRefund() {
+					info.Billing.Refund(visionCtx)
+				}
+			}()
+		}
+
 		// 7. 获取 adaptor
 		apiType, _ := common.ChannelType2APIType(channel.Type)
 		adaptor := relay.GetAdaptor(apiType)
@@ -552,8 +631,14 @@ func storeInRequestCache(requestID string, imageURL string, desc string) {
 	}
 	entry, found, _ := requestCache.Get(requestID)
 	if !found || entry == nil {
-		entry = &requestCacheEntry{m: make(map[string]string)}
-		requestCache.Set(requestID, entry)
+		// 串行化创建：并发 miss 时只创建一个 entry，避免互相覆盖丢失内容
+		requestCacheInitMu.Lock()
+		entry, found, _ = requestCache.Get(requestID)
+		if !found || entry == nil {
+			entry = &requestCacheEntry{m: make(map[string]string)}
+			requestCache.Set(requestID, entry)
+		}
+		requestCacheInitMu.Unlock()
 	}
 	entry.mu.Lock()
 	entry.m[imageURL] = desc

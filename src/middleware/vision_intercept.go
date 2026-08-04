@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
 	"io"
 	"net/http"
 	"strconv"
@@ -74,7 +75,12 @@ func VisionIntercept() gin.HandlerFunc {
 		}
 
 		logger.LogInfo(c, fmt.Sprintf("[vision] intercepting model=%s suffix=%s", model, settings.VisionSuffix))
-		strippedModel := strings.TrimSuffix(model, settings.VisionSuffix)
+		strippedModel := strings.TrimSpace(strings.TrimSuffix(model, settings.VisionSuffix))
+		if strippedModel == "" {
+			// 模型名只剩后缀（如 "-vision"）无法映射到真实模型，直接拒绝
+			abortWithVisionError(c, http.StatusBadRequest, fmt.Sprintf("invalid model name %q: nothing remains after removing suffix %q", model, settings.VisionSuffix))
+			return
+		}
 
 		// 无消息 → 仅去后缀
 		messagesRaw := gjson.GetBytes(bodyBytes, "messages")
@@ -142,7 +148,8 @@ func VisionIntercept() gin.HandlerFunc {
 			}
 		}
 
-		// Phase A: 并行计算 pHash（CPU 密集型，信号量限制 8 并发）
+		// Phase A: 并行计算 pHash（CPU 密集型 + URL 下载，信号量限制 2 并发，
+		// 防止超大图片解码与多图下载耗尽内存）
 		requestID := c.GetString(common.RequestIdKey)
 		userId := c.GetInt("id")
 
@@ -153,7 +160,7 @@ func VisionIntercept() gin.HandlerFunc {
 		dedupedPhashes := make([]phashResult, len(dedupedImages))
 		{
 			var wg sync.WaitGroup
-			sem := make(chan struct{}, 8)
+			sem := make(chan struct{}, 2)
 			for i := range dedupedImages {
 				wg.Add(1)
 				go func(idx int) {
@@ -161,7 +168,14 @@ func VisionIntercept() gin.HandlerFunc {
 					sem <- struct{}{}
 					defer func() { <-sem }()
 
-					img, err := vision.DecodeBase64Image(dedupedImages[idx].ImageURL)
+					var img image.Image
+					var err error
+					if strings.HasPrefix(dedupedImages[idx].ImageURL, "data:") {
+						img, err = vision.DecodeBase64Image(dedupedImages[idx].ImageURL)
+					} else {
+						// 网络 URL 图片：SSRF 校验 + 大小限制后下载计算 pHash
+						img, err = vision.DownloadImageForPhash(dedupedImages[idx].ImageURL)
+					}
 					if err != nil {
 						dedupedPhashes[idx] = phashResult{err: err}
 						return
